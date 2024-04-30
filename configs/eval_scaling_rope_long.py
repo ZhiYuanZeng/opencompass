@@ -7,6 +7,8 @@ from opencompass.tasks import OpenICLInferTask, OpenICLEvalTask
 with read_base():
     # from .datasets.collections.lclm_long import datasets
     from .datasets.collections.long_score_long import datasets
+    # from .mymodel.origin_scaling_rope_long import models
+    # from .mymodel.origin_llama2 import models
     from .mymodel.scaling_rope_long import models
 
 work_dir = './outputs/scaling_rope_long/'
@@ -16,7 +18,7 @@ infer = dict(
     # partitioner=dict(type='NaivePartitioner'),
     runner=dict(
         type=SlurmRunner,
-        max_num_workers=32,
+        max_num_workers=2,
         task=dict(type=OpenICLInferTask),
         retry=4),
 )
@@ -25,7 +27,7 @@ eval = dict(
     partitioner=dict(type=NaivePartitioner),
     runner=dict(
         type=SlurmRunner,
-        max_num_workers=8,
+        max_num_workers=2,
         task=dict(type=OpenICLEvalTask),
         retry=4),
 )

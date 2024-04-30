@@ -14,7 +14,11 @@ from opencompass.utils.logging import get_logger
 
 from opencompass.models.base import BaseModel, LMTemplateParser
 
+from typing import Dict, List, Optional, Union
+from torch.cuda.amp import autocast
+
 # sys.path.append('/cpfs01/shared/public/lvkai/workspace/collie/')    # FIXME: remove this line
+sys.path.append('/remote-home/mqhuang/kv-cache/collie/collie/')
 
 from collie import CollieConfig
 from transformers.generation.utils import GenerationConfig
@@ -60,7 +64,283 @@ def get_namespace_from_dict_for_sink(config: dict):
     
     return parser.parse_args(config)
 
+class PrunerModel(BaseModel):
+    
+    def __init__(
+        self,
+        collie_config_path: str,
+        pe_config: Dict, 
+        model_name_or_path: str,
+        pruner_type: str,
+        max_seq_len: int=4096,
+        perceiver_path: str=None,
+        tokenizer_only: bool=False,
+        long_bench_cat: int=-1,
+        batch_padding: bool=True,
+        extract_pred_after_decode: bool=True,
+        tokenizer_name_or_path: str=None,
+        tokenizer_kwargs: Dict={},
+        prompt_format: str='{prompt}',
+        meta_template: Optional[Dict]=None,
+    ):
+        super().__init__(path=collie_config_path,
+                         max_seq_len=max_seq_len,
+                         tokenizer_only=tokenizer_only,
+                         meta_template=meta_template)
+        config = CollieConfig.from_pretrained(collie_config_path, trust_remote_code=True)
+        config.model_config.num_hidden_layers = pe_config.get('num_hidden_layers', config.model_config.num_hidden_layers)
+        config.checkpointing = True
+        config.use_flash = pe_config.get('use_flash', config.use_flash)
+        chunk_size = pe_config.get('chunk_size', 512)
+        d_query = pe_config.get('d_query', config.hidden_size // 4)
+        query_len = pe_config.get('query_len', chunk_size // 8)
+        
+        num_sink_tokens = pe_config.get('num_sink_tokens', 4)
+        
+        # set pe_config
+        self.pe_config = pe_config
+        config.pe_config = pe_config
+        
+        d_model=config.hidden_size
+        num_heads=config.num_key_value_heads
+        num_layers=config.num_hidden_layers
+        
+        mem_perceiver_config = {
+            # llm config
+            "d_model": d_model,
+            "num_heads": num_heads,
+            "num_layers": num_layers,
+            # custom config
+            "query_len": query_len,
+            "d_query": d_query,
+            "chunk_size": chunk_size,
+            "num_sink_tokens": num_sink_tokens,
+        }
+        # init collie model config
+        setattr(config, 'mem_perceiver_config', mem_perceiver_config)
+        
+        if tokenizer_name_or_path:
+            self._load_toknizer(tokenizer_name_or_path=tokenizer_name_or_path, tokenizer_kwargs=tokenizer_kwargs)
+        else:
+            self._load_toknizer(tokenizer_name_or_path=model_name_or_path, tokenizer_kwargs=tokenizer_kwargs)
+        
+        if not tokenizer_only:
+            self._load_model(
+                model_name_or_path=model_name_or_path,
+                pruner_type=pruner_type,
+                config=config,
+                perceiver_path=perceiver_path
+            )
+            
+        self.long_bench_cat = long_bench_cat
+        self.batch_padding = batch_padding
+        self.extract_pred_after_decode = extract_pred_after_decode
+        self.prompt_format = prompt_format
+        self.meta_template = meta_template
+        self.max_seq_len = max_seq_len
+        
+        self.logger = get_logger()
+        
+        # set eval
+        self.model.eval().cuda()
+    
+    def _load_model(
+        self,     
+        model_name_or_path: str,
+        pruner_type: str,
+        config: CollieConfig,
+        perceiver_path: str=None,
+    ):
+        from collie.models.mem_perceiver import AutoPruner
+        self.model = AutoPruner.from_pretrained(
+            pruner_type=pruner_type,
+            config=config,
+            pretrained_model_name_or_path=model_name_or_path,
+            perceiver_path=perceiver_path
+        )
+    
+    def _load_toknizer(
+        self,
+        tokenizer_name_or_path: str,
+        tokenizer_kwargs: Dict,
+    ):
+        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name_or_path, **tokenizer_kwargs)
+        
+    def generate(self, inputs: List[str], max_out_len: int, **kwargs) -> List[str]:
+        eos_token_id = kwargs.get('eos_token_id', self.tokenizer.eos_token_id)
+        pad_token_id = self.tokenizer.pad_token_id if hasattr(self.tokenizer, 'pad_token_id') else 0
+        pad_token_id = kwargs.get('pad_token_id', pad_token_id)
+        num_beams = kwargs.get('num_beams', 1)
+        do_sample = kwargs.get('do_sample', False)
+        use_cache = kwargs.get('use_cache', True)
+        generation_config = GenerationConfig(
+            eos_token_id=eos_token_id,
+            pad_token_id=pad_token_id,
+            num_beams=num_beams, do_sample=do_sample, use_cache=use_cache
+        )
+        if self.batch_padding and len(inputs) > 1:
+            return self._batch_generate(inputs=inputs, max_out_len=max_out_len, generation_config=generation_config)
+        else:
+            return sum(
+                (
+                    self._single_generate(
+                        inputs=[input_], max_out_len=max_out_len, generation_config=generation_config
+                    ) for input_ in inputs
+                ),
+                []
+            )
+        
+    def _batch_generate(self, inputs: List[str], max_out_len: int, generation_config: GenerationConfig) -> List[str]:
+        if self.extract_pred_after_decode:
+            prompt_lens = [len(input_) for input_ in inputs]
 
+        # step-1: tokenize the input with batch_encode_plus
+        tokens = self.tokenizer.batch_encode_plus(inputs, padding=True, truncation=True, 
+                                                  max_length=self.max_seq_len - max_out_len)
+        tokens = {
+            k: torch.tensor(np.array(tokens[k]), device=self.model.device)
+            for k in tokens if k in ['input_ids', 'attention_mask']
+        }
+
+        outputs = self.model.generate(**tokens, generation_config=generation_config)
+
+        if not self.extract_pred_after_decode:
+            outputs = outputs[:, tokens['input_ids'].shape[1]:]
+        # self.logger.info('outputs return')
+        decodeds = self.tokenizer.batch_decode(outputs.cpu().tolist(), skip_special_tokens=True)
+        
+        if self.extract_pred_after_decode:
+            decodeds = [
+                token[len_:] for token, len_ in zip(decodeds, prompt_lens)
+            ]
+        
+        return decodeds
+    
+    def _single_generate(self, inputs: List[str], max_out_len: int, generation_config: GenerationConfig) -> List[str]:
+        if self.extract_pred_after_decode:
+            prompt_lens = [len(input_) for input_ in inputs]
+            
+        if self.long_bench_cat > 0:
+            inputs = [self.prompt_format.format(prompt=prompt) for prompt in inputs]
+            input_ids = self.tokenizer(inputs, padding=False, truncation=False)['input_ids']
+            input_ids = torch.tensor(input_ids)
+            if input_ids.shape[-1] > self.long_bench_cat:
+                input_ids = torch.cat([input_ids[:, : self.long_bench_cat // 2], input_ids[:, - self.long_bench_cat // 2:]], dim=-1).to(device=self.model.device)
+            else:
+                input_ids = input_ids.to(device=self.model.device)
+        elif self.pe_config.get('streaming_enable', False) and self.pe_config.get('memory_option', '') in ['', 'sink']:
+            input_ids = self.tokenizer(inputs, padding=False, truncation=False)['input_ids']
+            input_ids = torch.tensor(input_ids)
+            if input_ids.shape[-1] > self.pe_config['start_size'] + self.pe_config['local_size']:
+                input_ids = torch.cat([input_ids[:, : self.pe_config['start_size']], input_ids[:, - self.pe_config['local_size']:]], dim=-1).to(device=self.model.device)
+            else:
+                input_ids = input_ids.to(device=self.model.device)
+        else:
+            input_ids = self.tokenizer(inputs, padding=False, truncation=True, max_length=self.max_seq_len)['input_ids']
+            input_ids = torch.tensor(input_ids).to(device=self.model.device)
+        
+        generation_config.max_new_tokens = max_out_len
+        with autocast():
+            outputs = self.model.generate(input_ids=input_ids, generation_config=generation_config)
+        decodeds = self.tokenizer.batch_decode(outputs.cpu().tolist(), skip_special_tokens=True)
+        if self.extract_pred_after_decode:
+            decodeds = [
+                token[len_:] for token, len_ in zip(decodeds, prompt_lens)
+            ]
+        return decodeds
+    
+    def get_logits(self, inputs: List[str]):
+        if self.batch_padding and len(inputs) > 1:
+            tokens = self.tokenizer(inputs, padding=True, truncation=True,
+                                    max_length=self.max_seq_len)
+            tokens = {
+                k: torch.tensor(np.array(tokens[k]), device=self.model.device)
+                for k in tokens if k in ['input_ids', 'attention_mask']
+            }
+            outputs = self.model(**tokens)
+        else:
+            if self.long_bench_cat > 0:
+                inputs = [self.prompt_format.format(prompt=prompt) for prompt in inputs]
+                input_ids = self.tokenizer(inputs, padding=False, truncation=False)['input_ids']
+                input_ids = torch.tensor(input_ids)
+                if input_ids.shape[-1] > self.long_bench_cat:
+                    input_ids = torch.cat([input_ids[:, : self.long_bench_cat // 2], input_ids[:, - self.long_bench_cat // 2:]], dim=-1).to(device=self.model.device)
+                elif self.pe_config.get('streaming_enable', False) and self.pe_config.get('memory_option', '') in ['', 'sink']:
+                    input_ids = self.tokenizer(inputs, padding=False, truncation=False)['input_ids']
+                    input_ids = torch.tensor(input_ids)
+                    if input_ids.shape[-1] > self.pe_config['start_size'] + self.pe_config['local_size']:
+                        input_ids = torch.cat([input_ids[:, : self.pe_config['start_size']], input_ids[:, - self.pe_config['local_size']:]], dim=-1).to(device=self.model.device)
+                    else:
+                        input_ids = input_ids.to(device=self.model.device)
+                else:
+                    input_ids = input_ids.to(device=self.model.device)
+            else:
+                input_ids = self.tokenizer(inputs, padding=False, truncation=True, max_length=self.max_seq_len)['input_ids']
+                input_ids = torch.tensor(input_ids).to(device=self.model.device)
+            tokens = {'input_ids': input_ids}
+            outputs = self.model(input_ids)
+        return outputs.get('logits'), {'tokens': tokens}
+    
+    def get_ppl(self, inputs: List[str], mask_length: Optional[List[int]] = None) -> List[float]:
+        """Get perplexity scores given a list of inputs.
+
+        Args:
+            inputs (List[str]): A list of strings.
+            mask_length (Optional[List[int]]): A list of mask lengths. If
+                provided, the perplexity scores will be calculated with the
+                first mask_length[i] tokens masked out. It's okay to skip
+                its implementation if advanced features in PPLInfernecer is
+                not needed.
+
+        Returns:
+            List[float]: A list of perplexity scores.
+        """
+        if self.batch_padding and len(inputs) > 1:
+            assert self.tokenizer.pad_token
+            return self._get_ppl(inputs, mask_length=mask_length)
+        else:
+            return np.concatenate([
+                self._get_ppl(inputs=[text], mask_length=mask_length)
+                for text in inputs
+            ])
+    
+    def _get_ppl(self, inputs: List[str], mask_length: Optional[List[int]] = None) -> List[float]:
+        outputs, inputs = self.get_logits(inputs)
+        shift_logits = outputs[..., :-1, :].contiguous()
+        
+        shift_labels = inputs['tokens']['input_ids'][..., 1:].contiguous()
+        
+        # FIXME: if need to set the pad_token_id?
+        loss_fct = torch.nn.CrossEntropyLoss(reduction='none', ignore_index=self.tokenizer.pad_token_id)
+        loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)),
+                        shift_labels.view(-1)).view(shift_labels.size())
+        
+        if mask_length is not None:
+            mask = torch.zeros_like(shift_labels)   # [ batch, seqlen ]
+            for i in range(len(mask)):
+                for j in range(mask_length[i] - 1, len(mask[i])):
+                    mask[i][j] = 1
+            loss = loss * mask
+        
+        lens = (inputs['tokens']['input_ids'] != self.tokenizer.pad_token_id).sum(-1).cpu().numpy()
+        if mask_length is not None:
+            lens -= np.array(mask_length)
+        loss = loss.float()
+        ce_loss = loss.sum(-1).cpu().detach().numpy() / lens
+        return ce_loss
+    
+    def get_token_len(self, prompt: str) -> int:
+        """Get lengths of the tokenized strings.
+
+        Args:
+            prompt (str): Input string.
+
+        Returns:
+            int: Length of the input tokens
+        """
+        return super().get_token_len(prompt)
+        
+    
 # @MODELS.register_module()
 class CollieModel(BaseModel):
     """Model wrapper around HuggingFace CausalLM.
@@ -180,6 +460,9 @@ class CollieModel(BaseModel):
             self.model = LlamaForCausalLM.from_pretrained(model_path_or_name=model_path, 
                                                           config=config, trust_remote_code=True)
 
+        # use bf16
+        self.model = self.model.half()
+
         self.model.eval().cuda()
         
         # if model_type == 'sink' and 'attn' in pe_config['memory_option']:
@@ -200,7 +483,6 @@ class CollieModel(BaseModel):
         Returns:
             List[str]: A list of generated strings.
         """
-                
         if self.batch_padding and len(inputs) > 1:
             return self._batch_generate(inputs=inputs, max_out_len=max_out_len, **kwargs)
         else:
