@@ -18,7 +18,7 @@ from typing import Dict, List, Optional, Union
 from torch.cuda.amp import autocast
 
 # sys.path.append('/cpfs01/shared/public/lvkai/workspace/collie/')    # FIXME: remove this line
-sys.path.append('/remote-home/mqhuang/kv-cache/collie/collie/')
+# sys.path.append('/remote-home/mqhuang/kv-cache/collie/collie/')
 
 from collie import CollieConfig
 from transformers.generation.utils import GenerationConfig
@@ -197,8 +197,9 @@ class PrunerModel(BaseModel):
         generation_config = GenerationConfig(
             eos_token_id=eos_token_id,
             pad_token_id=pad_token_id,
-            num_beams=num_beams, do_sample=do_sample, use_cache=use_cache
+            num_beams=num_beams, do_sample=do_sample, use_cache=use_cache, max_new_tokens=max_out_len
         )
+        # print(generation_config, flush=True)
         if self.batch_padding and len(inputs) > 1:
             return self._batch_generate(inputs=inputs, max_out_len=max_out_len, generation_config=generation_config)
         else:
@@ -237,10 +238,7 @@ class PrunerModel(BaseModel):
         
         return decodeds
     
-    def _single_generate(self, inputs: List[str], max_out_len: int, generation_config: GenerationConfig) -> List[str]:
-        if self.extract_pred_after_decode:
-            prompt_lens = [len(input_) for input_ in inputs]
-            
+    def _single_generate(self, inputs: List[str], max_out_len: int, generation_config: GenerationConfig) -> List[str]:            
         if self.long_bench_cat > 0:
             inputs = [self.prompt_format.format(prompt=prompt) for prompt in inputs]
             input_ids = self.tokenizer(inputs, padding=False, truncation=False)['input_ids']
@@ -249,25 +247,19 @@ class PrunerModel(BaseModel):
                 input_ids = torch.cat([input_ids[:, : self.long_bench_cat // 2], input_ids[:, - self.long_bench_cat // 2:]], dim=-1).to(device=self.model.device)
             else:
                 input_ids = input_ids.to(device=self.model.device)
-        elif self.pe_config.get('streaming_enable', False) and self.pe_config.get('memory_option', '') in ['', 'sink']:
-            input_ids = self.tokenizer(inputs, padding=False, truncation=False)['input_ids']
-            input_ids = torch.tensor(input_ids)
-            if input_ids.shape[-1] > self.pe_config['start_size'] + self.pe_config['local_size']:
-                input_ids = torch.cat([input_ids[:, : self.pe_config['start_size']], input_ids[:, - self.pe_config['local_size']:]], dim=-1).to(device=self.model.device)
-            else:
-                input_ids = input_ids.to(device=self.model.device)
         else:
             input_ids = self.tokenizer(inputs, padding=False, truncation=True, max_length=self.max_seq_len)['input_ids']
             input_ids = torch.tensor(input_ids).to(device=self.model.device)
-        
         generation_config.max_new_tokens = max_out_len
-        with autocast():
-            outputs = self.model.generate(input_ids=input_ids, generation_config=generation_config)
-        decodeds = self.tokenizer.batch_decode(outputs.cpu().tolist(), skip_special_tokens=True)
+        outputs = self.model.generate(input_ids=input_ids, generation_config=generation_config)
+        
+        # print(self.tokenizer.batch_decode(outputs.cpu().tolist(), skip_special_tokens=True), flush=True)
         if self.extract_pred_after_decode:
-            decodeds = [
-                token[len_:] for token, len_ in zip(decodeds, prompt_lens)
-            ]
+            prompt_lens = [len(input_) for input_ in input_ids]
+            outputs = torch.stack([
+                o[len_:] for o, len_ in zip(outputs, prompt_lens)
+            ], dim=0)
+        decodeds = self.tokenizer.batch_decode(outputs.cpu().tolist(), skip_special_tokens=True)
         return decodeds
     
     def get_logits(self, inputs: List[str]):
@@ -331,7 +323,6 @@ class PrunerModel(BaseModel):
         
         shift_labels = inputs['tokens']['input_ids'][..., 1:].contiguous()
         
-        # FIXME: if need to set the pad_token_id?
         loss_fct = torch.nn.CrossEntropyLoss(reduction='none', ignore_index=self.tokenizer.pad_token_id)
         loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)),
                         shift_labels.view(-1)).view(shift_labels.size())
@@ -359,7 +350,7 @@ class PrunerModel(BaseModel):
         Returns:
             int: Length of the input tokens
         """
-        return super().get_token_len(prompt)
+        return len(self.tokenizer.encode(prompt))
         
     
 # @MODELS.register_module()
