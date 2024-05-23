@@ -183,11 +183,14 @@ class PrunerModel(BaseModel):
                 pretrained_model_name_or_path=model_name_or_path,
                 perceiver_path=perceiver_path
             )
+    
+    def _load_tokenizer(self, tokenizer_name_or_path: Optional[str], tokenizer_kwargs: dict):
+        
+        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name_or_path, **tokenizer_kwargs)  # , local_files_only=True
         
     def generate(self, inputs: List[str], max_out_len: int, **kwargs) -> List[str]:
-        eos_token_id = kwargs.get('eos_token_id', self.tokenizer.eos_token_id)
-        pad_token_id = self.tokenizer.pad_token_id if hasattr(self.tokenizer, 'pad_token_id') else 0
-        pad_token_id = kwargs.get('pad_token_id', pad_token_id)
+        eos_token_id = self.tokenizer.eos_token_id
+        pad_token_id = self.tokenizer.pad_token_id if hasattr(self.tokenizer, 'pad_token_id') else eos_token_id
         num_beams = kwargs.get('num_beams', 1)
         do_sample = kwargs.get('do_sample', False)
         use_cache = kwargs.get('use_cache', True)
