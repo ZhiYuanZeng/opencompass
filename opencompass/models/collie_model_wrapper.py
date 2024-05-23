@@ -70,10 +70,9 @@ class PrunerModel(BaseModel):
         self,
         collie_config_path: str,
         pe_config: Dict, 
+        compresser_config: Dict,
         model_name_or_path: str,
-        pruner_type: str,
         max_seq_len: int=4096,
-        perceiver_path: str=None,
         tokenizer_only: bool=False,
         long_bench_cat: int=-1,
         batch_padding: bool=True,
@@ -87,21 +86,34 @@ class PrunerModel(BaseModel):
                          max_seq_len=max_seq_len,
                          tokenizer_only=tokenizer_only,
                          meta_template=meta_template)
-        config = CollieConfig.from_pretrained(collie_config_path, trust_remote_code=True)
-        config.model_config.num_hidden_layers = pe_config.get('num_hidden_layers', config.model_config.num_hidden_layers)
+        config = CollieConfig.from_pretrained(collie_config_path, trust_remote_code=True, dtype=torch.float16)
+        
+        config.use_flash = True
+        config.ds_config = {
+            'bf16': {
+                'enabled': True,
+            },
+        }
+        
+        config.tp_size = int(os.environ['WORLD_SIZE'])
+        config.dp_size = 1
+        config.model_config.num_hidden_layers = compresser_config.get('num_hidden_layers', config.model_config.num_hidden_layers)
         config.checkpointing = True
-        config.use_flash = pe_config.get('use_flash', config.use_flash)
-        chunk_size = pe_config.get('chunk_size', 512)
-        d_query = pe_config.get('d_query', config.hidden_size // 4)
-        query_len = pe_config.get('query_len', chunk_size // 8)
         
-        num_sink_tokens = pe_config.get('num_sink_tokens', 4)
-        
+        chunk_size = compresser_config.get('chunk_size', 512)
+        d_query = compresser_config.get('d_query', config.hidden_size // 4)
+        compressed_chunk_size = compresser_config.get('compressed_chunk_size', chunk_size // 8)
+        num_sink_tokens = compresser_config.get('num_sink_tokens', 4)
+        pruner_type = compresser_config.get('pruner_type', None)
+        fuser_type = compresser_config.get('fuser_type', None)
+        memory_type = compresser_config.get('memory_type', None)
+        perceiver_path = compresser_config.get('perceiver_path', None)
+        assert pruner_type is not None or fuser_type is not None
         # set pe_config
         self.pe_config = pe_config
         config.pe_config = pe_config
         
-        d_model=config.hidden_size
+        d_model=config.hidden_size // config.num_attention_heads * config.num_key_value_heads
         num_heads=config.num_key_value_heads
         num_layers=config.num_hidden_layers
         
@@ -111,23 +123,26 @@ class PrunerModel(BaseModel):
             "num_heads": num_heads,
             "num_layers": num_layers,
             # custom config
-            "query_len": query_len,
+            "query_len": compressed_chunk_size,
             "d_query": d_query,
+            "compressed_chunk_size": compressed_chunk_size,
             "chunk_size": chunk_size,
             "num_sink_tokens": num_sink_tokens,
+            "memory_type": memory_type,
         }
         # init collie model config
         setattr(config, 'mem_perceiver_config', mem_perceiver_config)
         
         if tokenizer_name_or_path:
-            self._load_toknizer(tokenizer_name_or_path=tokenizer_name_or_path, tokenizer_kwargs=tokenizer_kwargs)
+            self._load_tokenizer(tokenizer_name_or_path=tokenizer_name_or_path, tokenizer_kwargs=tokenizer_kwargs)
         else:
-            self._load_toknizer(tokenizer_name_or_path=model_name_or_path, tokenizer_kwargs=tokenizer_kwargs)
+            self._load_tokenizer(tokenizer_name_or_path=model_name_or_path, tokenizer_kwargs=tokenizer_kwargs)
         
         if not tokenizer_only:
             self._load_model(
                 model_name_or_path=model_name_or_path,
                 pruner_type=pruner_type,
+                fuser_type=fuser_type,
                 config=config,
                 perceiver_path=perceiver_path
             )
@@ -140,6 +155,7 @@ class PrunerModel(BaseModel):
         self.max_seq_len = max_seq_len
         
         self.logger = get_logger()
+        self.model = self.model.to(torch.bfloat16)
         
         # set eval
         self.model.eval().cuda()
@@ -148,23 +164,25 @@ class PrunerModel(BaseModel):
         self,     
         model_name_or_path: str,
         pruner_type: str,
+        fuser_type: str,
         config: CollieConfig,
         perceiver_path: str=None,
     ):
-        from collie.models.mem_perceiver import AutoPruner
-        self.model = AutoPruner.from_pretrained(
-            pruner_type=pruner_type,
-            config=config,
-            pretrained_model_name_or_path=model_name_or_path,
-            perceiver_path=perceiver_path
-        )
-    
-    def _load_toknizer(
-        self,
-        tokenizer_name_or_path: str,
-        tokenizer_kwargs: Dict,
-    ):
-        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name_or_path, **tokenizer_kwargs)
+        from collie.models.mem_perceiver import AutoPruner, AutoFuser
+        if pruner_type is not None:
+            self.model = AutoPruner.from_pretrained(
+                pruner_type=pruner_type,
+                config=config,
+                pretrained_model_name_or_path=model_name_or_path,
+                perceiver_path=perceiver_path
+            )
+        elif fuser_type is not None:
+            self.model = AutoFuser.from_pretrained(
+                fuser_type=fuser_type,
+                config=config,
+                pretrained_model_name_or_path=model_name_or_path,
+                perceiver_path=perceiver_path
+            )
         
     def generate(self, inputs: List[str], max_out_len: int, **kwargs) -> List[str]:
         eos_token_id = kwargs.get('eos_token_id', self.tokenizer.eos_token_id)
